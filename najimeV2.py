@@ -34,8 +34,14 @@ LATERAL_REFRACTORY = 2
 MOTIVATION_GAIN = 2
 MOTIVATION_IDLE_WINDOW = 10
 
-MAX_OUT = 8
+HIPPO_GAIN = 3
+HIPPO_FLOOR = -19
+HIPPO_REST = 6
+HIPPO_REFRACTORY = 3
+
 SIGNAL_MAX = 65000
+EDGE_GROW_CHUNK = 4096
+TARGET_WINDOW = 32
 
 REGION_ORDER = ['input', 'sensory', 'dg', 'ca3', 'ca1',
                 'thought', 'motor', 'motivation', 'output']
@@ -55,20 +61,50 @@ for r in REGION_ORDER:
     _off += REGION_SIZES[r]
 N = _off
 
+HIPPO_LO = OFFSETS['dg']
+HIPPO_HI = OFFSETS['ca1'] + REGION_SIZES['ca1']
+
+
+# ==================== DYNAMIC DTYPE SELECTION ====================
+def _min_uint(max_val):
+    if max_val <= 0xFF:
+        return np.uint8
+    if max_val <= 0xFFFF:
+        return np.uint16
+    if max_val <= 0xFFFFFFFF:
+        return np.uint32
+    return np.uint64
+
 
 # ==================== NUMBA ====================
 @njit(cache=True)
-def _propagate(active, active_count, targets, target_count, last_used,
+def _propagate(active, active_count, head, edge_dst, edge_next, edge_last_used,
                fire_pot, potential, spike_th_mod, meta,
                signal_id, address_map, mg_th, tick):
     for k in range(active_count):
         src = active[k]
-        cnt = int(target_count[src])
         fp = int(fire_pot[src])
         s_src = int(signal_id[src])
-        if cnt == 0:
-            d = int(address_map[src])
-            if d >= 0:
+        d_anat = int(address_map[src])
+        if d_anat >= 0:
+            m = int(spike_th_mod[d_anat])
+            mg_eff = mg_th + m
+            if mg_eff < 0:
+                mg_eff = 0
+            v = fp - mg_eff
+            if v > 0:
+                cur = int(potential[d_anat])
+                nv = cur + v
+                if nv > 255:
+                    nv = 255
+                potential[d_anat] = np.uint8(nv)
+                if s_src != 0:
+                    signal_id[d_anat] = s_src
+                meta[d_anat] = np.uint16(int(meta[d_anat]) | 1)
+        e = head[src]
+        while e != -1:
+            d = int(edge_dst[e])
+            if d != d_anat:
                 m = int(spike_th_mod[d])
                 mg_eff = mg_th + m
                 if mg_eff < 0:
@@ -83,67 +119,57 @@ def _propagate(active, active_count, targets, target_count, last_used,
                     if s_src != 0:
                         signal_id[d] = s_src
                     meta[d] = np.uint16(int(meta[d]) | 1)
-        else:
-            for j in range(cnt):
-                d = int(targets[src, j])
-                m = int(spike_th_mod[d])
-                mg_eff = mg_th + m
-                if mg_eff < 0:
-                    mg_eff = 0
-                v = fp - mg_eff
-                if v > 0:
-                    cur = int(potential[d])
-                    nv = cur + v
-                    if nv > 255:
-                        nv = 255
-                    potential[d] = np.uint8(nv)
-                    if s_src != 0:
-                        signal_id[d] = s_src
-                    meta[d] = np.uint16(int(meta[d]) | 1)
-                    last_used[src, j] = tick
+                    edge_last_used[e] = tick
+            e = edge_next[e]
 
 
 @njit(cache=True)
-def _ltp_free(active_prev, active_prev_count, active_curr, active_curr_count,
-              fire_pot_prev, spike_th_mod, is_port,
-              targets, target_count, mg_th, max_out):
+def _ltp_stream(active_prev, active_prev_count, spike_curr,
+                fire_pot_prev, spike_th_mod, is_port,
+                mini_start, mini_end, port_idx, adj_bitmap, bitmap_words,
+                mg_th, target_window):
     out_src = np.empty(active_prev_count, dtype=np.int32)
     out_dst = np.empty(active_prev_count, dtype=np.int32)
-    out_slot = np.empty(active_prev_count, dtype=np.int32)
     count = 0
     for ks in range(active_prev_count):
         src = active_prev[ks]
         if is_port[src] == 0:
             continue
-        cnt = int(target_count[src])
-        if cnt >= max_out:
+        col_lo = int(mini_start[src])
+        col_hi = int(mini_end[src])
+        col_size = col_hi - col_lo
+        if col_size <= 1:
+            continue
+        pi = int(port_idx[src])
+        if pi < 0:
             continue
         fp = int(fire_pot_prev[src])
-        picked = -1
-        for kc in range(active_curr_count):
-            dst = active_curr[kc]
+        base_off = src - col_lo
+        for i in range(1, target_window + 1):
+            off = (base_off + i) % col_size
+            dst = col_lo + off
             if is_port[dst] == 0:
                 continue
-            dup = False
-            for j in range(cnt):
-                if int(targets[src, j]) == dst:
-                    dup = True
-                    break
-            if dup:
+            if spike_curr[dst] == 0:
                 continue
             m = int(spike_th_mod[dst])
             mg_eff = mg_th + m
             if mg_eff < 0:
                 mg_eff = 0
-            if fp - mg_eff > 0:
-                picked = dst
-                break
-        if picked >= 0:
+            if fp - mg_eff <= 0:
+                continue
+            di = int(port_idx[dst])
+            if di < 0:
+                continue
+            w = pi * bitmap_words + (di >> 6)
+            bit = np.uint64(1) << np.uint64(di & 63)
+            if adj_bitmap[w] & bit:
+                continue
             out_src[count] = src
-            out_dst[count] = picked
-            out_slot[count] = cnt
+            out_dst[count] = dst
             count += 1
-    return out_src[:count], out_dst[:count], out_slot[:count], count
+            break
+    return out_src[:count], out_dst[:count], count
 
 
 # ==================== ENGINE ====================
@@ -180,10 +206,28 @@ class NAJime:
         self.is_port = np.zeros(N, dtype=np.uint8)
         self.signal_id = np.zeros(N, dtype=np.uint16)
         self._init_layout()
+        self._init_minicolumns()
 
-        self.targets = np.full((N, MAX_OUT), -1, dtype=np.int32)
-        self.target_count = np.zeros(N, dtype=np.uint8)
-        self.last_used = np.full((N, MAX_OUT), -1, dtype=np.int32)
+        self.port_idx = np.full(N, -1, dtype=np.int32)
+        k = 0
+        for i in range(N):
+            if self.is_port[i]:
+                self.port_idx[i] = k
+                k += 1
+        self.n_ports = k
+        self.bitmap_words = (self.n_ports + 63) // 64
+        self.adj_bitmap = np.zeros(self.n_ports * self.bitmap_words,
+                                   dtype=np.uint64)
+
+        self.DST_DTYPE = _min_uint(N - 1)
+        self.USED_DTYPE = _min_uint(0)
+
+        self.head = np.full(N, -1, dtype=np.int32)
+        self.edge_count = 0
+        self.edge_dst = np.empty(0, dtype=self.DST_DTYPE)
+        self.edge_next = np.empty(0, dtype=np.int32)
+        self.edge_prev = np.empty(0, dtype=np.int32)
+        self.edge_last_used = np.empty(0, dtype=self.USED_DTYPE)
 
         self.address_map = self._build_address_map()
 
@@ -225,6 +269,24 @@ class NAJime:
                             self.base_th[nid] = BASE_TH - PORT_TH_OFFSET + extra
                         else:
                             self.base_th[nid] = BASE_TH
+
+    def _init_minicolumns(self):
+        self.mini_start = np.zeros(N, dtype=np.int32)
+        self.mini_end = np.zeros(N, dtype=np.int32)
+        for r in REGION_ORDER:
+            if r in ('input', 'output'):
+                lo = OFFSETS[r]
+                hi = lo + REGION_SIZES[r]
+                for i in range(lo, hi):
+                    self.mini_start[i] = lo
+                    self.mini_end[i] = hi
+                continue
+            for c in range(REGION_COLS[r]):
+                lo = OFFSETS[r] + c * COL_SIZE
+                hi = lo + COL_SIZE
+                for i in range(lo, hi):
+                    self.mini_start[i] = lo
+                    self.mini_end[i] = hi
 
     def _build_address_map(self):
         addr = np.full(N, -1, dtype=np.int32)
@@ -277,17 +339,92 @@ class NAJime:
                     addr[ps] = pd
         return addr
 
-    def _add_edge(self, src, dst):
-        cnt = int(self.target_count[src])
-        if cnt >= MAX_OUT:
+    def _bitmap_get(self, src, dst):
+        pi = int(self.port_idx[src]); di = int(self.port_idx[dst])
+        if pi < 0 or di < 0:
             return False
-        for j in range(cnt):
-            if int(self.targets[src, j]) == dst:
-                return False
-        self.targets[src, cnt] = dst
-        self.target_count[src] = cnt + 1
-        self.last_used[src, cnt] = self.tick_count
+        w = pi * self.bitmap_words + (di >> 6)
+        return bool(self.adj_bitmap[w] & (np.uint64(1) << np.uint64(di & 63)))
+
+    def _bitmap_set(self, src, dst):
+        pi = int(self.port_idx[src]); di = int(self.port_idx[dst])
+        if pi < 0 or di < 0:
+            return
+        w = pi * self.bitmap_words + (di >> 6)
+        self.adj_bitmap[w] |= (np.uint64(1) << np.uint64(di & 63))
+
+    def _bitmap_clear(self, src, dst):
+        pi = int(self.port_idx[src]); di = int(self.port_idx[dst])
+        if pi < 0 or di < 0:
+            return
+        w = pi * self.bitmap_words + (di >> 6)
+        self.adj_bitmap[w] &= ~(np.uint64(1) << np.uint64(di & 63))
+
+    def _ensure_edge_capacity(self, need):
+        cap = self.edge_dst.shape[0]
+        if need <= cap:
+            return
+        new_cap = max(need, cap + max(EDGE_GROW_CHUNK, cap // 2))
+        new_dst = np.empty(new_cap, dtype=self.DST_DTYPE)
+        new_next = np.empty(new_cap, dtype=np.int32)
+        new_prev = np.empty(new_cap, dtype=np.int32)
+        new_used = np.empty(new_cap, dtype=self.USED_DTYPE)
+        n = self.edge_count
+        if n > 0:
+            new_dst[:n] = self.edge_dst[:n]
+            new_next[:n] = self.edge_next[:n]
+            new_prev[:n] = self.edge_prev[:n]
+            new_used[:n] = self.edge_last_used[:n]
+        self.edge_dst = new_dst
+        self.edge_next = new_next
+        self.edge_prev = new_prev
+        self.edge_last_used = new_used
+
+    def _add_edge(self, src, dst):
+        if self._bitmap_get(src, dst):
+            return False
+        self._bitmap_set(src, dst)
+        idx = self.edge_count
+        self._ensure_edge_capacity(idx + 1)
+        self.edge_dst[idx] = dst
+        self.edge_last_used[idx] = self.tick_count
+        old_head = int(self.head[src])
+        self.edge_prev[idx] = -1
+        self.edge_next[idx] = old_head
+        if old_head >= 0:
+            self.edge_prev[old_head] = idx
+        self.head[src] = idx
+        self.edge_count = idx + 1
         return True
+
+    def _remove_edge(self, src, e):
+        d = int(self.edge_dst[e])
+        self._bitmap_clear(src, d)
+        prev = int(self.edge_prev[e])
+        nxt = int(self.edge_next[e])
+        if prev == -1:
+            self.head[src] = nxt
+        else:
+            self.edge_next[prev] = nxt
+        if nxt != -1:
+            self.edge_prev[nxt] = prev
+
+    def _tick_maybe_upcast(self):
+        if self.tick_count > np.iinfo(self.USED_DTYPE).max:
+            new_dt = _min_uint(self.tick_count)
+            self.USED_DTYPE = new_dt
+            self.edge_last_used = self.edge_last_used.astype(new_dt)
+
+    def n_edges(self):
+        return int(self.edge_count)
+
+    def fanout(self, src):
+        n = 0
+        e = int(self.head[src])
+        while e != -1:
+            n += 1
+            e = int(self.edge_next[e])
+        return n
 
     def present_input(self, positions):
         self.signal_counter = (self.signal_counter % (SIGNAL_MAX - 1)) + 1
@@ -312,6 +449,71 @@ class NAJime:
         return (recent(last_fire(OFFSETS['output'])),
                 recent(last_fire(OFFSETS['output'] + 1)))
 
+    def read_output_now(self):
+        return (int(self.spike_curr[OFFSETS['output']]),
+                int(self.spike_curr[OFFSETS['output'] + 1]))
+
+    def present_byte(self, b):
+        b = int(b) & 0xFF
+        self.signal_counter = (self.signal_counter % (SIGNAL_MAX - 1)) + 1
+        sid = self.signal_counter
+        for p in range(4):
+            lo = (b >> (2*p)) & 1
+            hi = (b >> (2*p+1)) & 1
+            nid_lo = 2*p
+            nid_hi = 2*p + 1
+            if lo:
+                self.potential[nid_lo] = INPUT_STRENGTH
+                self.signal_id[nid_lo] = sid
+            else:
+                self.potential[nid_lo] = 0
+            if hi:
+                self.potential[nid_hi] = INPUT_STRENGTH
+                self.signal_id[nid_hi] = sid
+            else:
+                self.potential[nid_hi] = 0
+        for p in range(4, 8):
+            self.potential[2*p] = 0
+            self.potential[2*p+1] = 0
+
+    def feed_byte(self, b, hold=4, gap=1):
+        for _ in range(hold):
+            self.present_byte(b)
+            self.tick()
+        for _ in range(gap):
+            self.tick()
+
+    def feed_text(self, text, hold=4, gap=1):
+        for ch in text:
+            b = ord(ch) & 0xFF
+            self.feed_byte(b, hold=hold, gap=gap)
+
+    def read_byte(self, max_ticks=30):
+        bits = []
+        for _ in range(max_ticks):
+            self.tick()
+            o0, o1 = self.read_output_now()
+            if o0 or o1:
+                bits.append((o0, o1))
+                if len(bits) == 4:
+                    b = 0
+                    for k, (a, c) in enumerate(bits):
+                        b |= (a << (2*k)) | (c << (2*k+1))
+                    return b
+        return -1
+
+    def chat(self, prompt, max_new=32, hold=4, gap=1):
+        self.feed_text(prompt, hold=hold, gap=gap)
+        out = []
+        for _ in range(max_new):
+            b = self.read_byte(max_ticks=30)
+            if b < 0:
+                out.append(0)
+                continue
+            out.append(b)
+            self.feed_byte(b, hold=hold, gap=gap)
+        return bytes(out)
+
     def reinforce(self, delta=3):
         cur = self.tick_count & 0x7FFF
         for i in range(N):
@@ -334,20 +536,25 @@ class NAJime:
 
     def _motivation_step(self):
         cur = self.tick_count & 0x7FFF
-        idle = True
-        for n in range(OFFSETS['thought'],
-                       OFFSETS['thought'] + REGION_SIZES['thought']):
-            last = (int(self.meta[n]) >> 1) & 0x7FFF
-            if last != 0 and ((cur - last) & 0x7FFF) <= MOTIVATION_IDLE_WINDOW:
-                idle = False
-                break
-        self.motivation_active = idle
-        if idle:
-            for reg in ('thought', 'motor'):
-                off = OFFSETS[reg]
-                for i in range(off, off + REGION_SIZES[reg]):
-                    m = int(self.spike_th_mod[i]) - MOTIVATION_GAIN
-                    self.spike_th_mod[i] = np.int8(max(m, -10))
+        for reg, gain, floor in (
+            ('thought', MOTIVATION_GAIN, -10),
+            ('motor',   MOTIVATION_GAIN, -10),
+            ('dg',      HIPPO_GAIN,      HIPPO_FLOOR),
+            ('ca3',     HIPPO_GAIN,      HIPPO_FLOOR),
+            ('ca1',     HIPPO_GAIN,      HIPPO_FLOOR),
+        ):
+            off = OFFSETS[reg]
+            sz = REGION_SIZES[reg]
+            idle = True
+            for n in range(off, off + sz):
+                last = (int(self.meta[n]) >> 1) & 0x7FFF
+                if last != 0 and ((cur - last) & 0x7FFF) <= MOTIVATION_IDLE_WINDOW:
+                    idle = False
+                    break
+            if idle:
+                for i in range(off, off + sz):
+                    m = int(self.spike_th_mod[i]) - gain
+                    self.spike_th_mod[i] = np.int8(max(m, floor))
 
     def _prune_ltd(self):
         removed = 0
@@ -355,55 +562,38 @@ class NAJime:
             reg_start = OFFSETS[reg]
             reg_end = reg_start + REGION_SIZES[reg]
             for src in range(reg_start, reg_end):
-                cnt = int(self.target_count[src])
-                keep, keep_used = [], []
-                for j in range(cnt):
-                    idle = self.tick_count - int(self.last_used[src, j])
-                    if idle <= DG_LTD_TICKS:
-                        keep.append(int(self.targets[src, j]))
-                        keep_used.append(int(self.last_used[src, j]))
-                    else:
+                e = int(self.head[src])
+                while e != -1:
+                    nxt = int(self.edge_next[e])
+                    if self.tick_count - int(self.edge_last_used[e]) > DG_LTD_TICKS:
+                        self._remove_edge(src, e)
                         removed += 1
-                for j in range(len(keep)):
-                    self.targets[src, j] = keep[j]
-                    self.last_used[src, j] = keep_used[j]
-                for j in range(len(keep), cnt):
-                    self.targets[src, j] = -1
-                    self.last_used[src, j] = -1
-                self.target_count[src] = len(keep)
+                    e = nxt
         return removed
 
     def _erase_hippo_edges(self):
         hip_start, hip_end = OFFSETS['dg'], OFFSETS['ca1'] + REGION_SIZES['ca1']
         for src in range(N):
-            cnt = int(self.target_count[src])
-            keep, keep_used = [], []
-            for j in range(cnt):
-                d = int(self.targets[src, j])
-                if not (hip_start <= d < hip_end):
-                    keep.append(d)
-                    keep_used.append(int(self.last_used[src, j]))
-            for j in range(len(keep)):
-                self.targets[src, j] = keep[j]
-                self.last_used[src, j] = keep_used[j]
-            for j in range(len(keep), cnt):
-                self.targets[src, j] = -1
-                self.last_used[src, j] = -1
-            self.target_count[src] = len(keep)
+            e = int(self.head[src])
+            while e != -1:
+                nxt = int(self.edge_next[e])
+                d = int(self.edge_dst[e])
+                if hip_start <= d < hip_end:
+                    self._remove_edge(src, e)
+                e = nxt
         self.episode_id += 1
         self.consolidations += 1
 
     def _ltp_step(self):
-        srcs, dsts, slots, cnt = _ltp_free(
+        srcs, dsts, cnt = _ltp_stream(
             self.active_prev, self.active_prev_count,
-            self.active_curr, self.active_curr_count,
+            self.spike_curr,
             self.fire_pot_prev, self.spike_th_mod, self.is_port,
-            self.targets, self.target_count, MG_TH, MAX_OUT)
+            self.mini_start, self.mini_end,
+            self.port_idx, self.adj_bitmap, self.bitmap_words,
+            MG_TH, TARGET_WINDOW)
         for k in range(cnt):
-            src = int(srcs[k]); dst = int(dsts[k]); slot = int(slots[k])
-            self.targets[src, slot] = dst
-            self.target_count[src] = slot + 1
-            self.last_used[src, slot] = self.tick_count
+            self._add_edge(int(srcs[k]), int(dsts[k]))
 
     def tick(self):
         potential = self.potential
@@ -411,16 +601,24 @@ class NAJime:
         base_th = self.base_th
         meta = self.meta
 
+        self._tick_maybe_upcast()
         self._motivation_step()
 
         self.fire_pot_curr[:] = 0
         self.spike_curr[:] = 0
         self.active_curr_count = 0
+        tc_next = (self.tick_count + 1) & 0x7FFF
         for i in range(N):
             thr = int(base_th[i]) + int(mod[i])
             if thr < 1: thr = 1
             elif thr > 255: thr = 255
             if int(potential[i]) >= thr:
+                if HIPPO_LO <= i < HIPPO_HI:
+                    last = (int(meta[i]) >> 1) & 0x7FFF
+                    if last != 0:
+                        dt = (tc_next - last) & 0x7FFF
+                        if dt <= HIPPO_REFRACTORY:
+                            continue
                 self.spike_curr[i] = 1
                 self.fire_pot_curr[i] = potential[i]
                 potential[i] = 0
@@ -430,7 +628,7 @@ class NAJime:
         self._ltp_step()
 
         _propagate(self.active_curr, self.active_curr_count,
-                   self.targets, self.target_count, self.last_used,
+                   self.head, self.edge_dst, self.edge_next, self.edge_last_used,
                    self.fire_pot_curr, potential, mod, meta,
                    self.signal_id, self.address_map, MG_TH, self.tick_count)
 
@@ -442,7 +640,12 @@ class NAJime:
 
         for i in range(N):
             p = int(potential[i])
-            if p > 0:
+            if p <= 0:
+                continue
+            if HIPPO_LO <= i < HIPPO_HI:
+                if p > HIPPO_REST:
+                    potential[i] = np.uint8(p - LEAK_STEP)
+            else:
                 potential[i] = np.uint8(p - LEAK_STEP if p >= LEAK_STEP else 0)
 
         tc = (self.tick_count + 1) & 0x7FFF
@@ -518,14 +721,24 @@ def _jaccard(a, b):
     return float((a & b).sum()) / u if u > 0 else 1.0
 
 
-def _run_pattern(pattern, n_ticks=12, settle=15):
+def _accumulate(eng, region, n_ticks):
+    a = OFFSETS[region]
+    b = a + REGION_SIZES[region]
+    accum = np.zeros(REGION_SIZES[region], dtype=bool)
+    for _ in range(n_ticks):
+        eng.tick()
+        accum |= eng.spike_curr[a:b].astype(bool)
+    return accum
+
+
+def _run_pattern(pattern, n_ticks=20, settle=15):
     e = NAJime(seed=1)
     for _ in range(settle):
         e.tick()
     regions = ('sensory', 'dg', 'ca3', 'ca1', 'thought', 'motor')
     accum = {r: np.zeros(REGION_SIZES[r], dtype=bool) for r in regions}
+    e.present_input(pattern)
     for _ in range(n_ticks):
-        e.present_input(pattern)
         e.tick()
         for r in regions:
             a = OFFSETS[r]
@@ -533,7 +746,6 @@ def _run_pattern(pattern, n_ticks=12, settle=15):
     return e, accum
 
 
-# --- plain-check helpers so tests never abort the run ---
 _passed = 0
 _failed = 0
 
@@ -553,12 +765,13 @@ def _check(label, condition, detail=""):
 
 
 def _test_1():
-    print("\nTest 1: 4 bytes/neuron, empty initial graph")
+    print("\nTest 1: 4 bytes/neuron, empty graph, intra-minicolumn LTP")
     eng = NAJime()
     total = eng.meta.nbytes + eng.potential.nbytes + eng.spike_th_mod.nbytes
     _check("4 bytes/neuron", total == 4 * N, f"N={N}, total={total}")
-    edges_init = int(eng.target_count.sum())
-    _check("empty initial graph", edges_init == 0, f"edges={edges_init}")
+    _check("empty initial graph", eng.n_edges() == 0)
+    print(f"    ports: {eng.n_ports}, bitmap_bytes: {eng.adj_bitmap.nbytes}, "
+          f"TARGET_WINDOW={TARGET_WINDOW}")
 
 
 def _test_2():
@@ -580,10 +793,8 @@ def _test_3():
                     for i in range(REGION_SIZES['input']))
     out_ports = sum(int(eng.is_port[OFFSETS['output'] + i])
                     for i in range(REGION_SIZES['output']))
-    _check("input all ports", inp_ports == REGION_SIZES['input'],
-           f"{inp_ports}/{REGION_SIZES['input']}")
-    _check("output no ports", out_ports == 0,
-           f"{out_ports}/{REGION_SIZES['output']}")
+    _check("input all ports", inp_ports == REGION_SIZES['input'])
+    _check("output no ports", out_ports == 0)
 
 
 def _test_4():
@@ -601,9 +812,9 @@ def _test_4():
     m_a0 = int(eng.spike_th_mod[a]); m_c0 = int(eng.spike_th_mod[c])
     eng.tick()
     m_a1 = int(eng.spike_th_mod[a]); m_c1 = int(eng.spike_th_mod[c])
-    _check("front facilitated", m_a1 < m_a0, f"{m_a0} -> {m_a1}")
-    _check("tail suppressed", m_c1 > m_c0, f"{m_c0} -> {m_c1}")
-    _check("front ends below tail", m_a1 < m_c1, f"{m_a1} < {m_c1}")
+    _check("front facilitated", m_a1 < m_a0)
+    _check("tail suppressed", m_c1 > m_c0)
+    _check("front below tail", m_a1 < m_c1)
 
 
 def _test_5():
@@ -626,14 +837,14 @@ def _test_5():
         if out_tick < 0 and (eng.spike_curr[out_off] or eng.spike_curr[out_off+1]):
             out_tick = t
     print(f"    spike trace (first 30): {trace[:30]}")
-    edges = int(eng.target_count.sum())
-    _check("edges self-assembled", edges > 0, f"edges={edges}")
+    print(f"    edges total = {eng.n_edges()}")
+    _check("edges self-assembled", eng.n_edges() > 0)
     _check("motor fired", motor_tick > 0, f"motor @ {motor_tick}")
     _check("output fired", out_tick > 0, f"output @ {out_tick}")
 
 
-def _test_6():
-    print("\nTest 6: epilepsy — 300 idle ticks")
+def _test_6a():
+    print("\nTest 6a: pure idle — no input, no episode, zero spikes")
     eng = NAJime()
     peak = 0
     for t in range(300):
@@ -641,11 +852,47 @@ def _test_6():
         s = int(eng.spike_curr.sum())
         if s > peak:
             peak = s
-    _check("no spontaneous spikes", peak == 0, f"peak={peak}")
+    _check("no spontaneous spikes without episode", peak == 0, f"peak={peak}")
+
+
+def _test_6b():
+    print("\nTest 6b: hungry hippocampus — per-neuron resonance")
+    eng = NAJime()
+    for _ in range(20):
+        eng.present_input([1, 1, 0, 0, 0, 0, 0, 0])
+        eng.tick()
+    probes = {
+        'dg':  OFFSETS['dg']  + 20,
+        'ca3': OFFSETS['ca3'] + 20,
+        'ca1': OFFSETS['ca1'] + 20,
+    }
+    fire_ticks = {k: [] for k in probes}
+    width_samples = []
+    for t in range(800):
+        eng.tick()
+        hip_n = int(eng.spike_curr[HIPPO_LO:HIPPO_HI].sum())
+        if hip_n > 0:
+            width_samples.append(hip_n)
+        for k, nid in probes.items():
+            if eng.spike_curr[nid]:
+                fire_ticks[k].append(t)
+    for k, ticks in fire_ticks.items():
+        if len(ticks) >= 2:
+            ints = [ticks[i+1] - ticks[i] for i in range(len(ticks)-1)]
+            avg = sum(ints) / len(ints)
+            print(f"    probe {k}: {len(ticks)} fires (avg int {avg:.1f})")
+        else:
+            print(f"    probe {k}: {len(ticks)} fires")
+    if width_samples:
+        print(f"    wavefront width avg={sum(width_samples)/len(width_samples):.2f}")
+    any_res = any(len(t) >= 2 for t in fire_ticks.values())
+    _check("at least one hippo probe fires repeatedly", any_res)
+    total_fires = sum(len(t) for t in fire_ticks.values())
+    _check("hippo sustains activity", total_fires >= 20)
 
 
 def _test_7():
-    print("\nTest 7: Jaccard — pattern separation")
+    print("\nTest 7: Jaccard — pattern separation (accumulate)")
     A   = [1,0,0,0,0,0,0,0]
     Ap1 = [1,1,0,0,0,0,0,0]
     Z   = [0,0,0,0,0,0,0,3]
@@ -659,7 +906,7 @@ def _test_7():
         print(f"    {reg:8s} J(A,A+1)={js:.3f}  J(A,Z)={jd:.3f}")
         if js < jd - 0.05:
             ok_all = False
-    _check("similar inputs at least as similar as dissimilar", ok_all)
+    _check("no anti-correlation", ok_all)
 
 
 def _test_8():
@@ -669,35 +916,37 @@ def _test_8():
         eng.present_input([1, 0, 0, 0, 0, 0, 0, 0])
         eng.tick()
     dg_off = OFFSETS['dg']
-    dg_edges = sum(int(eng.target_count[dg_off+i])
+    dg_edges = sum(eng.fanout(dg_off + i)
                    for i in range(REGION_SIZES['dg']))
     print(f"    DG edges after 60 ticks: {dg_edges}")
     if dg_edges == 0:
-        _check("DG prune (no edges yet)", True, "skipped, nothing to prune")
+        _check("DG prune (no edges yet)", True, "skipped")
         return
     for i in range(REGION_SIZES['dg']):
         src = dg_off + i
-        for j in range(int(eng.target_count[src])):
-            eng.last_used[src, j] = -DG_LTD_TICKS - 100
+        e = int(eng.head[src])
+        while e != -1:
+            eng.edge_last_used[e] = 0
+            e = int(eng.edge_next[e])
     eng.tick_count = DG_LTD_TICKS + 200
     removed = eng._prune_ltd()
-    after = sum(int(eng.target_count[dg_off+i])
-                for i in range(REGION_SIZES['dg']))
-    _check("all idle DG edges pruned",
-           removed == dg_edges,
-           f"{dg_edges} -> {after}, removed={removed}")
+    after = sum(eng.fanout(dg_off + i) for i in range(REGION_SIZES['dg']))
+    _check("all idle DG edges pruned", removed == dg_edges,
+           f"{dg_edges} -> {after}")
 
 
 def _test_9():
-    print("\nTest 9: LTP — one new edge per src per tick")
+    print("\nTest 9: intra-minicolumn LTP — fanout grows")
     eng = NAJime()
     for _ in range(15):
         eng.tick()
-    for _ in range(10):
+    for _ in range(400):
         eng.present_input([1,2,3,0,0,0,0,0])
         eng.tick()
-    total = int(eng.target_count.sum())
-    _check("LTP produces edges", total > 0, f"edges={total}")
+    total = eng.n_edges()
+    peak = max(eng.fanout(i) for i in range(N))
+    print(f"    edges total = {total}, peak fanout = {peak}")
+    _check("LTP produces edges", total > 0)
 
 
 def _test_10():
@@ -709,10 +958,12 @@ def _test_10():
         e1.tick(); e2.tick()
     same_pot = np.array_equal(e1.potential, e2.potential)
     same_mod = np.array_equal(e1.spike_th_mod, e2.spike_th_mod)
-    same_edges = np.array_equal(e1.target_count, e2.target_count)
+    same_edges = (e1.n_edges() == e2.n_edges())
+    same_bitmap = np.array_equal(e1.adj_bitmap, e2.adj_bitmap)
     _check("identical potential", same_pot)
     _check("identical mod", same_mod)
-    _check("identical target_count", same_edges)
+    _check("identical edge count", same_edges)
+    _check("identical bitmap", same_bitmap)
 
 
 def _test_11():
@@ -730,19 +981,95 @@ def _test_11():
             ot = t
         if mt >= 0 and ot >= 0: break
     lag = ot - mt
-    print(f"    motor @ {mt}, output @ {ot}")
+    print(f"    motor @ {mt}, output @ {ot}, lag = {lag}")
     _check("motor fired", mt > 0)
     _check("output fired", ot > 0)
-    _check("output lag reasonable (≤5)", 0 <= lag <= 5, f"lag={lag}")
+    _check("lag reasonable", 0 <= lag <= 5)
+
+
+def _test_12():
+    print("\nTest 12: extrapolation — 1-tick delay training")
+
+    A_b0   = [1, 0, 0, 0, 0, 0, 0, 0]
+    A_b1   = [0, 1, 0, 0, 0, 0, 0, 0]
+    A_full = [1, 1, 0, 0, 0, 0, 0, 0]
+
+    # --- naive baseline ---
+    e_base = NAJime(seed=1)
+    for _ in range(15): e_base.tick()
+    e_base.present_input(A_b0)
+    cue_naive = _accumulate(e_base, 'thought', 20)
+
+    # --- trained: b0, ONE tick, b1, settle ---
+    e = NAJime(seed=1)
+    for _ in range(15): e.tick()
+    for cycle in range(40):
+        e.present_input(A_b0)
+        e.tick()          # b0 at t
+        e.present_input(A_b1)
+        e.tick()          # b1 at t+1
+        for _ in range(8): e.tick()
+
+    # full reference
+    e.present_input(A_full)
+    full_sig = _accumulate(e, 'thought', 20)
+
+    # cue after training
+    e.present_input(A_b0)
+    cue_trained = _accumulate(e, 'thought', 20)
+
+    missing = full_sig & ~cue_naive
+    missing_n = int(missing.sum())
+    reached = int((cue_trained & missing).sum())
+    j_change = _jaccard(cue_trained, cue_naive)
+
+    print(f"    full active:        {int(full_sig.sum())}")
+    print(f"    cue naive active:   {int(cue_naive.sum())}")
+    print(f"    cue trained active: {int(cue_trained.sum())}")
+    print(f"    missing part:       {missing_n}")
+    print(f"    reached by cue:     {reached}")
+    print(f"    J(trained, naive):  {j_change:.3f}")
+
+    _check("full pattern reaches cortex", int(full_sig.sum()) > 0)
+    _check("training changed cue response", j_change < 0.95,
+           f"J={j_change:.3f}")
+    _check("cue after training reaches missing neurons", reached > 0,
+           f"{reached}/{missing_n}")
+
+
+def _test_13():
+    print("\nTest 13: episode reaches neocortex, survives hippo erase")
+    A = [1, 1, 0, 0, 0, 0, 0, 0]
+    e = NAJime(seed=7)
+    for _ in range(15): e.tick()
+    for cycle in range(40):
+        e.present_input(A)
+        for _ in range(5): e.tick()
+        for _ in range(3): e.tick()
+
+    e.present_input(A)
+    sig_A = _accumulate(e, 'thought', 20)
+    n_active = int(sig_A.sum())
+    print(f"    A signature: {n_active} neurons")
+    _check("episode reached cortex", n_active > 0)
+
+    e._erase_hippo_edges()
+    e.present_input(A)
+    sig_after = _accumulate(e, 'thought', 20)
+    j = _jaccard(sig_A, sig_after)
+    print(f"    J(before_erase, after_erase) = {j:.3f}")
+    _check("trace survives hippo erase", j > 0.5,
+           f"J={j:.3f}")
 
 
 def run_tests():
     global _passed, _failed
     _passed = 0
     _failed = 0
-    print("=== NAJime v2 (self-assembling, no initial graph) ===")
+    print("=== NAJime v2 (intra-minicolumn streaming LTP) ===")
     for fn in (_test_1, _test_2, _test_3, _test_4, _test_5,
-               _test_6, _test_7, _test_8, _test_9, _test_10, _test_11):
+               _test_6a, _test_6b, _test_7, _test_8, _test_9,
+               _test_10, _test_11, _test_12, _test_13):
         try:
             fn()
         except Exception as e:
@@ -754,7 +1081,9 @@ def run_tests():
 # ==================== REPL ====================
 def run_repl():
     eng = NAJime(seed=1)
-    print("NAJime v2 REPL | p v0..v7 | t N | o | r D | s D | q")
+    print("NAJime v2 REPL (intra-minicolumn LTP)")
+    print("  p v0..v7 | pb N | f TEXT | c TEXT | t N")
+    print("  o / on | rb [N] | trace N | r D | s D | q")
     while True:
         try:
             line = input("> ").strip()
@@ -762,30 +1091,73 @@ def run_repl():
             break
         if not line:
             continue
-        parts = line.split()
+        parts = line.split(maxsplit=1)
         cmd = parts[0]
-        if cmd == 'q': break
+        arg = parts[1] if len(parts) > 1 else ""
+        if cmd == 'q':
+            break
         elif cmd == 'p':
-            vals = [int(x) & 3 for x in parts[1:9]]
+            vals = [int(x) & 3 for x in arg.split()[:8]]
             while len(vals) < 8: vals.append(0)
-            eng.present_input(vals); print(f"  {vals}")
+            eng.present_input(vals)
+            print(f"  presented {vals}")
+        elif cmd == 'pb':
+            n = int(arg) & 0xFF
+            for _ in range(4):
+                eng.present_byte(n); eng.tick()
+            eng.tick()
+            print(f"  presented byte {n} = 0b{n:08b}")
+        elif cmd == 'f':
+            b = arg.encode('latin-1', errors='replace')
+            eng.feed_text(arg, hold=4, gap=1)
+            print(f"  fed {len(b)} bytes: {b.hex()}")
+        elif cmd == 'c':
+            b = arg.encode('latin-1', errors='replace')
+            out = eng.chat(arg, max_new=32, hold=4, gap=1)
+            asc = ''.join(chr(x) if 32 <= x < 127 else '.' for x in out)
+            print(f"  in : {b.hex()}")
+            print(f"  out: {out.hex()}")
+            print(f"  asc: {asc}")
         elif cmd == 't':
-            n = int(parts[1]) if len(parts) > 1 else 1
+            n = int(arg) if arg else 1
             for _ in range(n): eng.tick()
             print(f"  ran {n} (total {eng.tick_count})")
         elif cmd == 'o':
-            print("  " + str(eng.read_output()))
+            print(f"  output (recent) = {eng.read_output()}")
+        elif cmd == 'on':
+            print(f"  output (now)    = {eng.read_output_now()}")
+        elif cmd == 'rb':
+            max_t = int(arg) if arg else 30
+            b = eng.read_byte(max_ticks=max_t)
+            if b < 0:
+                print(f"  read_byte: no events within {max_t} ticks")
+            else:
+                ch = chr(b) if 32 <= b < 127 else '.'
+                print(f"  read_byte = {b} = 0b{b:08b} = '{ch}'")
+        elif cmd == 'trace':
+            n = int(arg) if arg else 20
+            print("  tick | out  | mot  tht  ca1  ca3   dg  sen | total")
+            for _ in range(n):
+                eng.tick()
+                o0, o1 = eng.read_output_now()
+                c = {r: int(eng.spike_curr[OFFSETS[r]:
+                                          OFFSETS[r] + REGION_SIZES[r]].sum())
+                     for r in ('motor', 'thought', 'ca1', 'ca3', 'dg', 'sensory')}
+                tot = int(eng.spike_curr.sum())
+                print(f"  {eng.tick_count-1:4d} | ({o0},{o1}) | "
+                      f"{c['motor']:4d} {c['thought']:4d} {c['ca1']:4d} "
+                      f"{c['ca3']:4d} {c['dg']:4d} {c['sensory']:4d} | {tot:5d}")
         elif cmd == 'r':
-            eng.reinforce(int(parts[1]) if len(parts) > 1 else 3); print("  +")
+            eng.reinforce(int(arg) if arg else 3); print("  +")
         elif cmd == 's':
-            eng.suppress(int(parts[1]) if len(parts) > 1 else 3); print("  -")
+            eng.suppress(int(arg) if arg else 3); print("  -")
         else:
-            print("  ?")
+            print("  unknown")
 
 
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "repl":
-        run_repl()
-    else:
+    if len(sys.argv) > 1 and sys.argv[1] == "test":
         run_tests()
+    else:
+        run_repl()
